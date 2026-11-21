@@ -253,3 +253,280 @@ def test_validation_errors(client):
                     json={"business_date": "2026/11/21", "as_of": AS_OF})
     assert r.status_code == 422
     assert client.get("/api/catalogs/999").status_code == 404
+
+
+# ---------- 重建排障目录：输入快照 ----------
+
+def _snapshot_rows(client, check_id):
+    """直接查库读取核查快照（白盒断言用）。"""
+    import sqlite3
+    db_path = client.app.state.db_path
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        reports = [dict(r) for r in conn.execute(
+            "SELECT * FROM check_input_reports WHERE check_id=? ORDER BY position",
+            (check_id,))]
+        parts = [dict(r) for r in conn.execute(
+            "SELECT * FROM check_input_partitions WHERE check_id=? ORDER BY id",
+            (check_id,))]
+        return reports, parts, conn.execute(
+            "SELECT COUNT(*) FROM catalogs").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_check_persists_input_snapshot(client):
+    """运行核查即保存依赖与所涉小时的全部提交，快照小时仅限窗口并集。"""
+    parts = full_day()
+    parts.append(mk_partition(3, day="2026-11-19"))  # 窗口外的小时不应进入快照
+    cid = setup_catalog(client, parts, reports=[
+        {"name": "日报A", "offset_days": 1, "grace_minutes": 30},
+        {"name": "日报B", "offset_days": 1, "grace_minutes": 60},
+    ])
+    check = run_check(client, cid)
+    reports, snap_parts, _ = _snapshot_rows(client, check["id"])
+    assert [r["report_name"] for r in reports] == ["日报A", "日报B"]
+    assert [r["grace_minutes"] for r in reports] == [30, 60]
+    hours = {p["partition_hour"] for p in snap_parts}
+    assert len(hours) == 24                      # 两个日报共用窗口，只存一组小时
+    assert "2026-11-19T03:00:00+00:00" not in hours
+    assert len(snap_parts) == 24                 # 每小时一条准时记录，不重复复制
+    detail = client.get(f"/api/checks/{check['id']}").json()
+    assert detail["has_snapshot"] is True
+
+
+def test_snapshot_keeps_duplicates_and_low_revisions(client):
+    """同一小时内的重复提交与较低修订号记录在快照中全部保留。"""
+    parts = full_day(overrides={
+        5: [mk_partition(5, submitted_min=180, revision=1),
+            mk_partition(5, submitted_min=55, revision=2)],
+        9: [mk_partition(9), mk_partition(9)],
+    })
+    cid = setup_catalog(client, parts)
+    check = run_check(client, cid)
+    _, snap_parts, _ = _snapshot_rows(client, check["id"])
+    h5 = [p for p in snap_parts if p["partition_hour"].startswith("2026-11-20T05")]
+    h9 = [p for p in snap_parts if p["partition_hour"].startswith("2026-11-20T09")]
+    assert sorted(p["revision"] for p in h5) == [1, 2]
+    assert len(h9) == 2 and {p["revision"] for p in h9} == {1}
+
+
+def test_rebuild_reproduces_results_after_source_upload_and_reset(client):
+    """源目录补传、再清空后，仍能从原核查快照重建出完全相同的新目录与结论。"""
+    parts = full_day(overrides={
+        5: [mk_partition(5, submitted_min=180, revision=1),
+            mk_partition(5, submitted_min=55, revision=2)],
+        9: [mk_partition(9), mk_partition(9)],
+    })
+    cid = setup_catalog(client, parts, reports=[
+        {"name": "运营日报", "offset_days": 1, "grace_minutes": 60},
+        {"name": "设备日报", "offset_days": 1, "grace_minutes": 30},
+        {"name": "前日回顾报", "offset_days": 2, "grace_minutes": 30},
+    ])
+    check = run_check(client, cid)
+
+    # 源目录补传（并发/后续补传场景）：新增 09 点 r3，旧快照不应受影响
+    client.post(f"/api/catalogs/{cid}/partitions",
+                json={"partitions": [mk_partition(9, revision=3)]})
+    r = client.post(f"/api/checks/{check['id']}/rebuild", json={"name": "排障目录-补传后"})
+    assert r.status_code == 201, r.text
+    rebuilt = r.json()
+    assert rebuilt["catalog_id"] != cid
+    assert rebuilt["id"] != check["id"]
+    assert rebuilt["results"] == check["results"]   # 逐日报逐小时完全一致
+
+    # 新目录的依赖、分区（含重复与低修订）与结论已一并保存
+    new_parts = client.get(f"/api/catalogs/{rebuilt['catalog_id']}/partitions").json()["partitions"]
+    assert len(new_parts) == 26                      # 24 小时 + 05 点 r1/r2 + 09 点两条 r1
+    h9 = [p for p in new_parts if p["partition_hour"].startswith("2026-11-20T09")]
+    # 核查之后补传的 r3 不在快照里：重建复现的是核查当时的目录
+    assert sorted(p["revision"] for p in h9) == [1, 1]
+    new_reports = client.get(f"/api/catalogs/{rebuilt['catalog_id']}/reports").json()["reports"]
+    assert [(x["name"], x["offset_days"], x["grace_minutes"]) for x in new_reports] == [
+        ("运营日报", 1, 60), ("设备日报", 1, 30), ("前日回顾报", 2, 30)]
+    new_check = client.get(f"/api/checks/{rebuilt['id']}").json()
+    assert new_check["business_date"] == check["business_date"]
+    assert new_check["as_of"] == check["as_of"]
+    assert new_check["rebuilt_from_check_id"] == check["id"]
+    assert new_check["has_snapshot"] is True
+
+    # 清空源目录后再次重建：仍可复现原结论
+    client.post(f"/api/catalogs/{cid}/reset")
+    r2 = client.post(f"/api/checks/{check['id']}/rebuild", json={})
+    assert r2.status_code == 201, r2.text
+    assert r2.json()["results"] == check["results"]
+    assert r2.json()["copied_partitions"] == 26
+
+
+def test_rebuild_old_check_without_snapshot_returns_409(client):
+    """旧核查未保存输入时，明确返回不可重建说明。"""
+    cid = setup_catalog(client, full_day())
+    check = run_check(client, cid)
+    import sqlite3
+    conn = sqlite3.connect(client.app.state.db_path)
+    try:
+        conn.execute("UPDATE checks SET snapshot_saved=0 WHERE id=?", (check["id"],))
+        conn.execute("DELETE FROM check_input_reports WHERE check_id=?", (check["id"],))
+        conn.execute("DELETE FROM check_input_partitions WHERE check_id=?", (check["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+    r = client.post(f"/api/checks/{check['id']}/rebuild", json={})
+    assert r.status_code == 409
+    assert "无法重建" in r.json()["detail"]
+    detail = client.get(f"/api/checks/{check['id']}").json()
+    assert detail["has_snapshot"] is False
+    assert client.post("/api/checks/99999/rebuild", json={}).status_code == 404
+
+
+def test_rebuild_failure_leaves_no_catalog_or_copied_rows(client, monkeypatch):
+    """重建写入中途失败：不保存新目录，也不留下任何复制记录或新核查。"""
+    import app.main as main_mod
+    cid = setup_catalog(client, full_day())
+    check = run_check(client, cid)
+    before_catalogs = len(client.get("/api/catalogs").json()["catalogs"])
+    before_checks = len(client.get(f"/api/catalogs/{cid}/checks").json()["checks"])
+
+    real = main_mod.create_check_record
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(main_mod, "create_check_record", boom)
+    r = client.post(f"/api/checks/{check['id']}/rebuild", json={"name": "应回滚"})
+    monkeypatch.setattr(main_mod, "create_check_record", real)
+    assert r.status_code == 500
+    catalogs = client.get("/api/catalogs").json()["catalogs"]
+    assert len(catalogs) == before_catalogs
+    assert all(c["name"] != "应回滚" for c in catalogs)
+    assert len(client.get(f"/api/catalogs/{cid}/checks").json()["checks"]) == before_checks
+
+    # 回滚后仍可正常重建
+    ok = client.post(f"/api/checks/{check['id']}/rebuild", json={})
+    assert ok.status_code == 201, ok.text
+
+
+def test_legacy_db_migrates_checks_as_not_rebuildable(tmp_path):
+    """旧库（无快照列/表）可平滑升级；既有核查标记为未保存输入。"""
+    import sqlite3
+    from app import db as db_mod
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE catalogs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+        CREATE TABLE checks (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            catalog_id INTEGER NOT NULL, catalog_version INTEGER NOT NULL,
+            business_date TEXT NOT NULL, as_of TEXT NOT NULL, created_at TEXT NOT NULL);
+        INSERT INTO catalogs(name, version, created_at) VALUES ('旧目录', 0, 'x');
+        INSERT INTO checks(catalog_id, catalog_version, business_date, as_of, created_at)
+            VALUES (1, 0, '2026-11-21', '2026-11-21T06:00:00+00:00', 'x');
+    """)
+    conn.commit(); conn.close()
+    db_mod.init_db(path)
+    conn = sqlite3.connect(path); conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM checks WHERE id=1").fetchone()
+        assert row["snapshot_saved"] == 0 and row["rebuilt_from_check_id"] is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM check_input_reports").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+# ---------- 并发：补传 / 清空 与 核查、重建 ----------
+
+def test_concurrent_uploads_and_resets_do_not_corrupt_checks(client):
+    """并发补传/清空时：每次核查仍对应一个完整目录版本，重建始终复现自身结论。
+
+    使用真实 sqlite 文件 + 多线程（TestClient 线程安全），验证 BEGIN IMMEDIATE
+    写锁与 busy_timeout 下不会读到半批上传，也不会产生残缺快照。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    cid = setup_catalog(client, full_day(), reports=[
+        {"name": "运营日报", "offset_days": 1, "grace_minutes": 60},
+        {"name": "设备日报", "offset_days": 1, "grace_minutes": 30},
+    ])
+
+    def uploader(i: int):
+        if i % 4 == 3:
+            return client.post(f"/api/catalogs/{cid}/reset")
+        hour = i % 24
+        rev = 10 + i
+        return client.post(f"/api/catalogs/{cid}/partitions",
+                           json={"partitions": [mk_partition(hour, revision=rev)]})
+
+    def checker(_i: int):
+        return client.post(f"/api/catalogs/{cid}/checks",
+                           json={"business_date": BIZ, "as_of": AS_OF})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        up_futs = [pool.submit(uploader, i) for i in range(24)]
+        chk_futs = [pool.submit(checker, i) for i in range(12)]
+        for f in up_futs:
+            assert f.result().status_code in (200, 201)
+        checks = [f.result() for f in chk_futs]
+    assert all(r.status_code == 201 for r in checks), [r.text for r in checks]
+
+    # 每条核查都可重建，且重建结论与核查结论逐字段一致
+    for r in checks:
+        check = r.json()
+        rebuilt = client.post(f"/api/checks/{check['id']}/rebuild", json={})
+        assert rebuilt.status_code == 201, rebuilt.text
+        assert rebuilt.json()["results"] == check["results"]
+
+    # 最终目录状态可再核查一次，且快照记录数 == 复制记录数 == 目录记录数
+    final = run_check(client, cid)
+    _, snap_parts, _ = _snapshot_rows(client, final["id"])
+    parts_now = client.get(f"/api/catalogs/{cid}/partitions").json()["partitions"]
+    assert len(snap_parts) == len(parts_now)
+
+
+def test_rebuild_rejects_corrupted_snapshot_without_writing(client):
+    """快照损坏（如记录被改）时不重建：409，且不新增目录或核查。"""
+    import sqlite3
+    cid = setup_catalog(client, full_day())
+    check = run_check(client, cid)
+    conn = sqlite3.connect(client.app.state.db_path)
+    try:
+        conn.execute(
+            "UPDATE check_input_partitions SET revision = 99 WHERE check_id = ?"
+            " AND partition_hour LIKE '2026-11-20T09%'", (check["id"],))
+        conn.commit()
+    finally:
+        conn.close()
+    before = len(client.get("/api/catalogs").json()["catalogs"])
+    r = client.post(f"/api/checks/{check['id']}/rebuild", json={})
+    assert r.status_code == 409
+    assert "不一致" in r.json()["detail"]
+    assert len(client.get("/api/catalogs").json()["catalogs"]) == before
+
+
+def test_rebuild_accepts_empty_body_or_named_catalog(client):
+    """重建请求体可省略；默认命名包含来源核查号，也可自定名称。"""
+    cid = setup_catalog(client, full_day())
+    check = run_check(client, cid)
+    r = client.post(f"/api/checks/{check['id']}/rebuild")  # 无请求体
+    assert r.status_code == 201, r.text
+    default_name = {c["id"]: c["name"] for c in client.get("/api/catalogs").json()["catalogs"]}[
+        r.json()["catalog_id"]]
+    assert default_name == f"排障-核查#{check['id']}"
+    r2 = client.post(f"/api/checks/{check['id']}/rebuild", json={"name": "  自定义  "})
+    assert r2.status_code == 201, r2.text
+    names = {c["id"]: c["name"] for c in client.get("/api/catalogs").json()["catalogs"]}
+    assert names[r2.json()["catalog_id"]] == "自定义"
+
+
+def test_rebuild_empty_snapshot_reproduces_all_missing(client):
+    """核查时目录为空（或刚被清空）：快照为空但合法，重建为同样的全缺失结论。"""
+    cid = setup_catalog(client, [])
+    check = run_check(client, cid)
+    assert check["results"][0]["block_reason"] == "MISSING"
+    r = client.post(f"/api/checks/{check['id']}/rebuild", json={})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["copied_partitions"] == 0
+    assert body["results"] == check["results"]
+    assert client.get(f"/api/catalogs/{body['catalog_id']}/partitions").json()["partitions"] == []
+    assert len(client.get(f"/api/catalogs/{body['catalog_id']}/reports").json()["reports"]) == 1

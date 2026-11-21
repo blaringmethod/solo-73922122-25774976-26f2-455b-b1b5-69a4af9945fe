@@ -125,13 +125,17 @@
 
   <section id="resultSection" style="display:none">
     <h2>核查结果 <span class="hint" id="resultMeta"></span></h2>
+    <div class="row" id="rebuildRow" style="display:none">
+      <span class="muted" id="snapshotHint"></span>
+      <button id="btnRebuild" class="ghost">重建排障目录</button>
+    </div>
     <div class="cards" id="resultCards"></div>
   </section>
 
   <section>
-    <h2>历史核查 <span class="hint">目录或依赖更新后，旧结果自动标记为已失效</span></h2>
+    <h2>历史核查 <span class="hint">目录或依赖更新后，旧结果自动标记为已失效；有输入快照的核查可重建排障目录</span></h2>
     <table id="checkTable">
-      <thead><tr><th>#</th><th>业务日期</th><th>截至时刻</th><th>目录版本</th><th>就绪/阻断</th><th>有效性</th><th>运行时间</th><th></th></tr></thead>
+      <thead><tr><th>#</th><th>业务日期</th><th>截至时刻</th><th>目录版本</th><th>就绪/阻断</th><th>有效性</th><th>输入快照</th><th>运行时间</th><th></th></tr></thead>
       <tbody></tbody>
     </table>
   </section>
@@ -259,6 +263,12 @@ function renderCheck(check) {
     </div>`;
   }).join("");
   window._lastCheck = check;
+  const canRebuild = !!check.has_snapshot;
+  $("rebuildRow").style.display = "flex";
+  $("btnRebuild").disabled = !canRebuild;
+  $("snapshotHint").textContent = canRebuild
+    ? "该核查已保存输入快照：可在新目录按原业务日期与截至时刻复现，再试补传或调整依赖。"
+    : "该核查生成于输入快照功能上线前，未保存日报依赖与分区记录，无法重建。";
 }
 
 function toggleDetail(i) {
@@ -287,12 +297,14 @@ async function loadChecks() {
   if (!currentCatalog) { tb.innerHTML = ""; return; }
   const { checks } = await api(`/api/catalogs/${currentCatalog.id}/checks`);
   tb.innerHTML = checks.map(c => `<tr>
-    <td>#${c.id}</td><td>${c.business_date}</td><td>${fmt(c.as_of)}</td><td>v${c.catalog_version}</td>
+    <td>#${c.id}${c.rebuilt_from_check_id ? ` <span class="muted">(重建自 #${c.rebuilt_from_check_id})</span>` : ""}</td>
+    <td>${c.business_date}</td><td>${fmt(c.as_of)}</td><td>v${c.catalog_version}</td>
     <td>${c.summary.READY || 0} / ${c.summary.BLOCKED || 0}</td>
     <td>${c.stale ? badge("stale", "已失效") : badge("valid", "有效")}</td>
+    <td>${c.has_snapshot ? "已保存" : `<span class="muted" title="该核查未保存输入，无法重建">未保存</span>`}</td>
     <td>${fmt(c.created_at)}</td>
     <td><button class="ghost" onclick="viewCheck(${c.id})">查看</button></td>
-  </tr>`).join("") || `<tr><td colspan="8" class="muted">暂无核查记录</td></tr>`;
+  </tr>`).join("") || `<tr><td colspan="9" class="muted">暂无核查记录</td></tr>`;
 }
 
 async function viewCheck(id) {
@@ -302,6 +314,24 @@ async function viewCheck(id) {
     if (check.stale) toast("注意：该核查基于旧目录快照，结果已失效", "err");
     $("resultSection").scrollIntoView({ behavior: "smooth" });
   } catch (e) { toast(e.message, "err"); }
+}
+
+async function rebuildCheck() {
+  const check = window._lastCheck;
+  if (!check) return;
+  const input = prompt("新排障目录名称：", `排障-核查#${check.id}`);
+  if (input === null) return;
+  try {
+    const r = await api(`/api/checks/${check.id}/rebuild`, {
+      method: "POST", body: JSON.stringify({ name: input.trim() || null }),
+    });
+    await loadCatalogs(r.catalog_id);
+    renderCheck({ ...r, rebuilt_from_check_id: check.id });
+    $("resultCards").scrollIntoView({ behavior: "smooth" });
+    toast(`已重建目录 #${r.catalog_id}（复制 ${r.copied_partitions} 条分区、${r.copied_reports} 个日报），可在新目录试补传或调整依赖`, "ok");
+  } catch (e) {
+    toast("重建失败：" + e.message, "err");
+  }
 }
 
 // ---------- 事件 ----------
@@ -359,6 +389,7 @@ $("btnAddReport").addEventListener("click", async () => {
 });
 
 $("btnRunCheck").addEventListener("click", runCheck);
+$("btnRebuild").addEventListener("click", rebuildCheck);
 
 $("btnDemo").addEventListener("click", async () => {
   try {

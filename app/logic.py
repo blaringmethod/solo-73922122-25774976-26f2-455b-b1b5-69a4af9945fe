@@ -162,6 +162,68 @@ def evaluate_report(
     }
 
 
+def build_input_snapshot(
+    reports: list[Mapping[str, Any]],
+    business_date: date,
+    rows_by_hour: Mapping[str, list[Mapping[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """构造一次核查的输入快照。
+
+    - 日报依赖按传入顺序（即报表 id 顺序）保存；
+    - 所有日报窗口的并集小时去重，多个日报共用的小时只复制一组记录；
+    - 每个小时复制目录中的**全部**提交记录：重复提交与较低修订号记录都保留，
+      否则重建时无法复现重复提交/修订替代的判定。
+    """
+    hours: list[str] = []
+    seen: set[str] = set()
+    for rep in reports:
+        for hour in window_hours(business_date, int(rep["offset_days"])):
+            hour_iso = iso(hour)
+            if hour_iso not in seen:
+                seen.add(hour_iso)
+                hours.append(hour_iso)
+
+    partition_rows: list[dict[str, Any]] = []
+    for hour_iso in sorted(hours):
+        for row in rows_by_hour.get(hour_iso, []):
+            partition_rows.append({
+                "partition_hour": hour_iso,
+                "planned_deadline": row["planned_deadline"],
+                "submitted_at": row["submitted_at"],
+                "revision": int(row["revision"]),
+            })
+
+    report_rows = [{
+        "report_name": rep.get("report_name", rep.get("name")),
+        "offset_days": int(rep["offset_days"]),
+        "grace_minutes": int(rep["grace_minutes"]),
+    } for rep in reports]
+    return report_rows, partition_rows
+
+
+def evaluate_reports(
+    reports: list[Mapping[str, Any]],
+    business_date: date,
+    rows_by_hour: Mapping[str, list[Mapping[str, Any]]],
+    as_of: Any,
+) -> list[dict[str, Any]]:
+    """按给定依赖与分区记录评估全部日报（运行核查与重建共用，保证同一语义）。"""
+    results = []
+    for rep in reports:
+        name = rep.get("report_name", rep.get("name"))
+        offset = int(rep["offset_days"])
+        grace = int(rep["grace_minutes"])
+        window = window_hours(business_date, offset)
+        res = evaluate_report(window, rows_by_hour, as_of, grace)
+        results.append({
+            "report_name": name,
+            "offset_days": offset,
+            "grace_minutes": grace,
+            **res,
+        })
+    return results
+
+
 def classify_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """为分区列表页计算每行状态标记。
 
